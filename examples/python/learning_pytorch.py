@@ -313,6 +313,7 @@ class PPOAgent:
 
             values = torch.tensor(values, dtype=torch.float32).to(DEVICE)
             advantage = torch.tensor(advantage, dtype=torch.float32).to(DEVICE)
+            n_step_returns = torch.tensor(n_step_returns, dtype=torch.float32).to(DEVICE)
             
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
@@ -333,7 +334,7 @@ class PPOAgent:
                     actor_loss = -torch.min(weighted_probs, weighted_clipped_probs).mean()
                     
                     critic_value, _ = self.critic(states)
-                    critic_value = critic_value.squeeze(1)
+                    critic_value = critic_value.squeeze()
                     returns = n_step_returns[batch]
                     critic_loss = F.mse_loss(returns, critic_value)
 
