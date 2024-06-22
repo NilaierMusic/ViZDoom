@@ -17,34 +17,24 @@ from tqdm import trange
 import vizdoom as vzd
 
 # Q-learning settings
-base_lr = 1.1679909049322575e-05
-max_lr = 0.003956458377296167
-batch_size = 94
-hidden_size = 385
-num_layers = 2
-n_epochs = 13
-gae_lambda = 0.9315539776097506
-policy_clip = 0.19695780904032728
-
-
-cycle_length = 1000
+learning_rate = 0.00025
 discount_factor = 0.99
-train_epochs = 20
-learning_steps_per_epoch = 5000
+train_epochs = 10
+learning_steps_per_epoch = 4000
 
 # NN learning settings
-batch_size = 94
+batch_size = 64
 
 # Training regime
 test_episodes_per_epoch = 100
 
 # Other parameters
-frame_repeat = 4
+frame_repeat = 12
 resolution = (90, 120)  # (height, width)
 episodes_to_watch = 10
-num_frames = 4
+num_frames = 4  # Add this line
 
-model_savefile = "./model-doom-ppo-cnn-lstm.pth"
+model_savefile = "./model-doom-ppo-residual.pth"
 save_model = True
 load_model = False
 skip_learning = False
@@ -60,15 +50,15 @@ else:
     DEVICE = torch.device("cpu")
 
 class PPOMemory:
-    def __init__(self, batch_size):
+    def __init__(self, batch_size, n_steps):
         self.states = []
         self.actions = []
         self.probs = []
         self.vals = []
         self.rewards = []
         self.dones = []
-        self.hiddens = []
         self.batch_size = batch_size
+        self.n_steps = n_steps
 
     def generate_batches(self):
         n_states = len(self.states)
@@ -76,18 +66,16 @@ class PPOMemory:
         indices = np.arange(n_states, dtype=np.int64)
         np.random.shuffle(indices)
         batches = [indices[i:i+self.batch_size] for i in batch_start]
-        return (np.array(self.states), np.array(self.actions), np.array(self.probs),
-                np.array(self.vals), np.array(self.rewards), np.array(self.dones),
-                self.hiddens, batches)
+        return np.array(self.states), np.array(self.actions), np.array(self.probs), \
+               np.array(self.vals), np.array(self.rewards), np.array(self.dones), batches
 
-    def store_memory(self, state, action, probs, vals, reward, done, hidden):
+    def store_memory(self, state, action, probs, vals, reward, done):
         self.states.append(state)
         self.actions.append(action)
         self.probs.append(probs)
         self.vals.append(vals)
         self.rewards.append(reward)
         self.dones.append(done)
-        self.hiddens.append(hidden)
 
     def clear_memory(self):
         self.states = []
@@ -96,7 +84,21 @@ class PPOMemory:
         self.vals = []
         self.rewards = []
         self.dones = []
-        self.hiddens = []
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        return F.relu(out)
 
 class FrameStack:
     def __init__(self, num_frames):
@@ -114,66 +116,124 @@ class FrameStack:
         return np.array(self.frames)
 
 def preprocess(img, resolution):
-    img_resized = cv2.resize(img, (resolution[1], resolution[0]), interpolation=cv2.INTER_AREA)
+    img_resized = cv2.resize(img, (resolution[1], resolution[0]), interpolation=cv2.INTER_LINEAR)
     img_resized = img_resized.astype(np.float32) / 255.0
     return img_resized
 
-class CNNLSTMBase(nn.Module):
-    def __init__(self, input_dims, hidden_size=512, num_layers=1):
-        super(CNNLSTMBase, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        
-        cnn_out_size = self._get_cnn_output(input_dims)
-        
-        self.lstm = nn.LSTM(cnn_out_size, hidden_size, num_layers=num_layers, batch_first=True)
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-    def forward(self, x, hidden=None):
-        cnn_out = self.cnn(x)
-        if hidden is None:
-            hidden = self.init_hidden(x.size(0))
-        lstm_out, hidden = self.lstm(cnn_out.unsqueeze(1), hidden)
-        return lstm_out.squeeze(1), hidden
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(in_channels)
 
-    def _get_cnn_output(self, shape):
-        o = self.cnn(torch.zeros(1, *shape))
-        return int(np.prod(o.size()))
-
-    def init_hidden(self, batch_size):
-        h_0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(DEVICE)
-        c_0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(DEVICE)
-        return (h_0, c_0)
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        return F.relu(out)
 
 class ActorNetwork(nn.Module):
-    def __init__(self, input_dims, n_actions, hidden_size=512):
+    def __init__(self, input_dims, n_actions):
         super(ActorNetwork, self).__init__()
-        self.base = CNNLSTMBase(input_dims, hidden_size)
-        self.actor = nn.Linear(hidden_size, n_actions)
+        self.conv1 = nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.res1 = ResidualBlock(32)
+        self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.res2 = ResidualBlock(64)
+        self.conv3 = nn.Conv2d(64, 64, 3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.res3 = ResidualBlock(64)
+        
+        self.flatten = nn.Flatten()
+        
+        conv_out_size = self._get_conv_output(input_dims)
+        
+        self.lstm = nn.LSTM(conv_out_size, 512, batch_first=True)
+        self.fc1 = nn.Linear(512, 256)
+        self.fc2 = nn.Linear(256, n_actions)
+
+    def _get_conv_output(self, shape):
+        o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
+        o = self.res1(o)
+        o = F.relu(self.bn2(self.conv2(o)))
+        o = self.res2(o)
+        o = F.relu(self.bn3(self.conv3(o)))
+        o = self.res3(o)
+        return int(np.prod(o.size()))
 
     def forward(self, state, hidden=None):
-        x, new_hidden = self.base(state, hidden)
-        action_probs = F.softmax(self.actor(x), dim=-1)
-        return action_probs, new_hidden
+        x = F.relu(self.bn1(self.conv1(state)))
+        x = self.res1(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.res2(x)
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.res3(x)
+        x = self.flatten(x)
+        x = x.unsqueeze(1)  # Add time dimension
+        
+        if hidden is None:
+            x, hidden = self.lstm(x)
+        else:
+            x, hidden = self.lstm(x, hidden)
+        
+        x = x.squeeze(1)
+        x = F.relu(self.fc1(x))
+        action_probs = F.softmax(self.fc2(x), dim=-1)
+        return action_probs, hidden
 
 class CriticNetwork(nn.Module):
-    def __init__(self, input_dims, hidden_size=512):
+    def __init__(self, input_dims):
         super(CriticNetwork, self).__init__()
-        self.base = CNNLSTMBase(input_dims, hidden_size)
-        self.critic = nn.Linear(hidden_size, 1)
+        self.conv1 = nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.res1 = ResidualBlock(32)
+        self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.res2 = ResidualBlock(64)
+        self.conv3 = nn.Conv2d(64, 64, 3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.res3 = ResidualBlock(64)
+        
+        self.flatten = nn.Flatten()
+        
+        conv_out_size = self._get_conv_output(input_dims)
+        
+        self.lstm = nn.LSTM(conv_out_size, 512, batch_first=True)
+        self.fc1 = nn.Linear(512, 256)
+        self.fc2 = nn.Linear(256, 1)
+
+    def _get_conv_output(self, shape):
+        o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
+        o = self.res1(o)
+        o = F.relu(self.bn2(self.conv2(o)))
+        o = self.res2(o)
+        o = F.relu(self.bn3(self.conv3(o)))
+        o = self.res3(o)
+        return int(np.prod(o.size()))
 
     def forward(self, state, hidden=None):
-        x, new_hidden = self.base(state, hidden)
-        value = self.critic(x)
-        return value, new_hidden
+        x = F.relu(self.bn1(self.conv1(state)))
+        x = self.res1(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.res2(x)
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.res3(x)
+        x = self.flatten(x)
+        x = x.unsqueeze(1)  # Add time dimension
+        
+        if hidden is None:
+            x, hidden = self.lstm(x)
+        else:
+            x, hidden = self.lstm(x, hidden)
+        
+        x = x.squeeze(1)
+        x = F.relu(self.fc1(x))
+        value = self.fc2(x)
+        return value, hidden
 
 class CyclicalLR:
     def __init__(self, optimizer, base_lr, max_lr, step_size):
@@ -201,76 +261,89 @@ class CyclicalLR:
         return self.optimizer.param_groups[0]['lr']
 
 class PPOAgent:
-    def __init__(self, input_dims, n_actions, num_frames=4, base_lr=0.0003, max_lr=0.001,
-                 cycle_length=1000, gamma=0.99, gae_lambda=0.95, policy_clip=0.2,
-                 batch_size=64, n_epochs=10, entropy_coefficient=0.01, max_grad_norm=0.5,
-                 weight_decay=0.01, accumulation_steps=1, n_steps=5):
+    def __init__(self, input_dims, n_actions, num_frames=4, base_lr=0.0001, max_lr=0.001, cycle_length=1000,
+                 gamma=0.99, gae_lambda=0.95, policy_clip=0.2, batch_size=64, n_epochs=10,
+                 entropy_coefficient=0.01, max_grad_norm=0.5, weight_decay=0.01, accumulation_steps=4, n_steps=5):
         self.gamma = gamma
         self.policy_clip = policy_clip
         self.n_epochs = n_epochs
         self.gae_lambda = gae_lambda
-        self.entropy_coefficient = entropy_coefficient
         self.max_grad_norm = max_grad_norm
         self.accumulation_steps = accumulation_steps
-        self.n_steps = n_steps
+        self.num_frames = num_frames
+        self.entropy_coefficient = entropy_coefficient  # Ensure this line is present
 
         self.actor = ActorNetwork(input_dims, n_actions).to(DEVICE)
         self.critic = CriticNetwork(input_dims).to(DEVICE)
         
-        self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), 
-                                    lr=base_lr, weight_decay=weight_decay)
-        self.scheduler = CyclicalLR(self.optimizer, base_lr, max_lr, cycle_length)
+        self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=base_lr, weight_decay=weight_decay)
+        self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=base_lr, weight_decay=weight_decay)
+        
+        self.actor_scheduler = CyclicalLR(self.actor_optimizer, base_lr, max_lr, cycle_length)
+        self.critic_scheduler = CyclicalLR(self.critic_optimizer, base_lr, max_lr, cycle_length)
 
-        self.memory = PPOMemory(batch_size)
+        self.memory = PPOMemory(batch_size, n_steps)
+        self.hidden_actor = None
+        self.hidden_critic = None
         self.scaler = GradScaler()
+        self.total_steps = 0
         self.frame_stack = FrameStack(num_frames)
+        
+        self.n_steps = n_steps
 
-    def store_transition(self, state, action, probs, vals, reward, done, hidden):
-        self.memory.store_memory(state, action, probs, vals, reward, done, hidden)
+    def store_transition(self, state, action, probs, vals, reward, done):
+        self.memory.store_memory(state, action, probs, vals, reward, done)
 
-    def choose_action(self, observation, hidden=None):
+    def choose_action(self, observation):
+        if observation.ndim == 2:  # Single frame
+            observation = np.stack([observation] * self.num_frames)
         state = torch.from_numpy(observation).float().unsqueeze(0).to(DEVICE)
-        if hidden is None:
-            hidden = self.actor.base.init_hidden(state.size(0))
-        
-        # Unpack the nested tuple
-        hidden_actor, hidden_critic = hidden
-        
-        with torch.no_grad():
-            probs, new_hidden_actor = self.actor(state, hidden_actor)
-            value, new_hidden_critic = self.critic(state, hidden_critic)
-        
+        probs, self.hidden_actor = self.actor(state, self.hidden_actor)
+        probs = probs.squeeze(0)
         dist = Categorical(probs)
         action = dist.sample()
         log_prob = dist.log_prob(action)
-        return action.item(), log_prob.item(), value.item(), (new_hidden_actor, new_hidden_critic)
+        value, self.hidden_critic = self.critic(state, self.hidden_critic)
+        return action.item(), log_prob.item(), value.item()
+
+    def calculate_n_step_returns(self, rewards, values, dones):
+        n_step_returns = np.zeros_like(rewards)
+        for t in range(len(rewards)):
+            n_step_return = 0
+            for k in range(self.n_steps):
+                if t + k < len(rewards):
+                    n_step_return += (self.gamma ** k) * rewards[t + k]
+                else:
+                    break
+            if t + self.n_steps < len(values):
+                n_step_return += (self.gamma ** self.n_steps) * values[t + self.n_steps]
+            n_step_returns[t] = n_step_return
+        return n_step_returns
 
     def learn(self):
         for _ in range(self.n_epochs):
-            state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr, hiddens_arr, batches = \
+            state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr, batches = \
                 self.memory.generate_batches()
 
             values = vals_arr
-            advantage = np.zeros(len(reward_arr), dtype=np.float32)
+            n_step_returns = self.calculate_n_step_returns(reward_arr, values, dones_arr)
+            advantage = n_step_returns - values
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
-            for t in range(len(reward_arr)-1):
-                discount = 1
-                a_t = 0
-                for k in range(t, len(reward_arr)-1):
-                    a_t += discount*(reward_arr[k] + self.gamma*values[k+1]*(1-int(dones_arr[k])) - values[k])
-                    discount *= self.gamma*self.gae_lambda
-                advantage[t] = a_t
-            advantage = torch.tensor(advantage).to(DEVICE)
-
-            values = torch.tensor(values).to(DEVICE)
-            for batch in batches:
-                states = torch.tensor(state_arr[batch], dtype=torch.float).to(DEVICE)
-                old_probs = torch.tensor(old_prob_arr[batch]).to(DEVICE)
-                actions = torch.tensor(action_arr[batch]).to(DEVICE)
-                hidden = (hiddens_arr[batch[0]][0], hiddens_arr[batch[0]][1])
+            values = torch.tensor(values, dtype=torch.float32).to(DEVICE)
+            advantage = torch.tensor(advantage, dtype=torch.float32).to(DEVICE)
+            n_step_returns = torch.tensor(n_step_returns, dtype=torch.float32).to(DEVICE)
+            
+            self.actor_optimizer.zero_grad()
+            self.critic_optimizer.zero_grad()
+            
+            for i, batch in enumerate(batches):
+                states = torch.tensor(state_arr[batch], dtype=torch.float32).to(DEVICE)
+                old_probs = torch.tensor(old_prob_arr[batch], dtype=torch.float32).to(DEVICE)
+                actions = torch.tensor(action_arr[batch], dtype=torch.long).to(DEVICE)
 
                 with autocast():
-                    probs, _ = self.actor(states, hidden)
+                    probs, _ = self.actor(states)
                     dist = Categorical(probs)
                     new_probs = dist.log_prob(actions)
                     prob_ratio = (new_probs - old_probs).exp()
@@ -278,28 +351,38 @@ class PPOAgent:
                     weighted_clipped_probs = torch.clamp(prob_ratio, 1-self.policy_clip,
                                                          1+self.policy_clip) * advantage[batch]
                     actor_loss = -torch.min(weighted_probs, weighted_clipped_probs).mean()
-
-                    critic_value, _ = self.critic(states, hidden)
+                    
+                    critic_value, _ = self.critic(states)
                     critic_value = critic_value.squeeze()
-                    returns = advantage[batch] + values[batch]
+                    returns = n_step_returns[batch]
                     critic_loss = F.mse_loss(returns, critic_value)
 
                     entropy = dist.entropy().mean()
-                    total_loss = actor_loss + 0.5 * critic_loss - self.entropy_coefficient * entropy
-                    total_loss = total_loss / self.accumulation_steps
-
-                self.scaler.scale(total_loss).backward()
-
-                if (batch_idx + 1) % self.accumulation_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(list(self.actor.parameters()) + list(self.critic.parameters()), max_norm=self.max_grad_norm)
-                    self.scaler.step(self.optimizer)
+                    total_loss = (actor_loss + 0.5 * critic_loss - self.entropy_coefficient * entropy) / self.accumulation_steps
+                
+                    self.scaler.scale(total_loss).backward()
+                
+                if (i + 1) % self.accumulation_steps == 0 or (i + 1) == len(batches):
+                    self.scaler.unscale_(self.actor_optimizer)
+                    self.scaler.unscale_(self.critic_optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                    
+                    self.scaler.step(self.actor_optimizer)
+                    self.scaler.step(self.critic_optimizer)
                     self.scaler.update()
-                    self.optimizer.zero_grad()
+                    
+                    self.actor_optimizer.zero_grad()
+                    self.critic_optimizer.zero_grad()
 
-            self.scheduler.step()
+                    self.actor_scheduler.step()
+                    self.critic_scheduler.step()
+
+                self.total_steps += 1
 
         self.memory.clear_memory()
+        self.hidden_actor = None
+        self.hidden_critic = None
 
 def create_simple_game():
     print("Initializing doom...")
@@ -314,19 +397,18 @@ def create_simple_game():
     return game
 
 def test(game, agent):
+    """Runs a test_episodes_per_epoch episodes and prints the result"""
     print("\nTesting...")
     test_scores = []
-    for _ in trange(test_episodes_per_epoch, leave=False):
+    for test_episode in trange(test_episodes_per_epoch, leave=False):
         game.new_episode()
-        agent.frame_stack.reset()
-        hidden = agent.actor.base.init_hidden(1)  # Initialize hidden state
+        agent.frame_stack.reset()  # Reset the frame stack at the start of each episode
         while not game.is_episode_finished():
             state = preprocess(game.get_state().screen_buffer, resolution)
-            agent.frame_stack.push(state)
-            stacked_state = agent.frame_stack.get()
-            action, _, _, new_hidden = agent.choose_action(stacked_state, hidden)
+            agent.frame_stack.push(state)  # Push the new state to the frame stack
+            stacked_state = agent.frame_stack.get()  # Get the stacked state
+            action, _, _ = agent.choose_action(stacked_state)  # Pass the stacked state to choose_action
             game.make_action(actions[action], frame_repeat)
-            hidden = new_hidden  # Update hidden state
         r = game.get_total_reward()
         test_scores.append(r)
 
@@ -344,32 +426,64 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
     for epoch in range(num_epochs):
         game.new_episode()
         train_scores = []
+        global_step = 0
         print(f"\nEpoch #{epoch + 1}")
+        agent.hidden_critic = None
         agent.frame_stack.reset()
-        hidden_actor = agent.actor.base.init_hidden(1)
-        hidden_critic = agent.critic.base.init_hidden(1)
-        hidden = (hidden_actor, hidden_critic)
+        
+        episode_states = []
+        episode_actions = []
+        episode_log_probs = []
+        episode_values = []
+        episode_rewards = []
+        episode_dones = []
         
         for _ in trange(steps_per_epoch, leave=False):
             state = preprocess(game.get_state().screen_buffer, resolution)
             agent.frame_stack.push(state)
             stacked_state = agent.frame_stack.get()
-            action, log_prob, value, new_hidden = agent.choose_action(stacked_state, hidden)
+            action, log_prob, value = agent.choose_action(stacked_state)
             reward = game.make_action(actions[action], frame_repeat)
+            
+            if actions[action] == [0, 0, 0]:
+                reward -= 0.1
             
             done = game.is_episode_finished()
 
-            agent.store_transition(stacked_state, action, log_prob, value, reward, done, new_hidden)
+            episode_states.append(stacked_state)
+            episode_actions.append(action)
+            episode_log_probs.append(log_prob)
+            episode_values.append(value)
+            episode_rewards.append(reward)
+            episode_dones.append(done)
 
-            hidden = new_hidden  # Update hidden state
+            if done or len(episode_states) == agent.n_steps:
+                if not done:
+                    _, _, last_value = agent.choose_action(stacked_state)
+                else:
+                    last_value = 0
+                
+                n_step_returns = agent.calculate_n_step_returns(episode_rewards, episode_values + [last_value], episode_dones)
+                
+                for i in range(len(episode_states)):
+                    agent.store_transition(episode_states[i], episode_actions[i], episode_log_probs[i], 
+                                           episode_values[i], n_step_returns[i], episode_dones[i])
+                
+                episode_states = []
+                episode_actions = []
+                episode_log_probs = []
+                episode_values = []
+                episode_rewards = []
+                episode_dones = []
 
             if done:
                 train_scores.append(game.get_total_reward())
                 game.new_episode()
+                agent.hidden_actor = None
+                agent.hidden_critic = None
                 agent.frame_stack.reset()
-                hidden_actor = agent.actor.base.init_hidden(1)
-                hidden_critic = agent.critic.base.init_hidden(1)
-                hidden = (hidden_actor, hidden_critic)
+
+            global_step += 1
 
         agent.learn()
         train_scores = np.array(train_scores)
@@ -385,9 +499,7 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
         test(game, agent)
         if save_model:
             print("Saving the network weights to:", model_savefile)
-            torch.save({
-                'actor_state_dict': agent.actor.state_dict()
-            }, model_savefile + "_actor.pth")
+            torch.save(agent.actor.state_dict(), model_savefile + "_actor.pth")
             torch.save(agent.critic.state_dict(), model_savefile + "_critic.pth")
         print("Total elapsed time: %.2f minutes" % ((time() - start_time) / 60.0))
 
@@ -404,12 +516,12 @@ if __name__ == "__main__":
     agent = PPOAgent(
         input_dims=(4, *resolution),
         n_actions=len(actions),
-        base_lr=1.1679909049322575e-05,
-        max_lr=0.003956458377296167,
+        base_lr=0.0001,
+        max_lr=0.001,
         cycle_length=1000,
         gamma=discount_factor,
         batch_size=batch_size,
-        n_epochs=13,
+        n_epochs=10,
         entropy_coefficient=0.01,
         max_grad_norm=0.5,
         weight_decay=0.01,
