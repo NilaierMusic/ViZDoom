@@ -68,7 +68,8 @@ class ActorNetwork(nn.Module):
         conv_out_size = self._get_conv_output(input_dims)
         
         self.lstm = nn.LSTM(conv_out_size, 512, batch_first=True)
-        self.fc = nn.Linear(512, n_actions)  # Changed from fc1 and fc2 to a single fc layer
+        self.fc1 = nn.Linear(512, 256)  # Changed back to fc1 and fc2
+        self.fc2 = nn.Linear(256, n_actions)
 
     def _get_conv_output(self, shape):
         o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
@@ -95,7 +96,8 @@ class ActorNetwork(nn.Module):
             x, hidden = self.lstm(x, hidden)
         
         x = x.squeeze(1)
-        action_probs = F.softmax(self.fc(x), dim=-1)  # Directly use fc instead of fc1 and fc2
+        x = F.relu(self.fc1(x))
+        action_probs = F.softmax(self.fc2(x), dim=-1)
         return action_probs, hidden
 
 class CriticNetwork(nn.Module):
@@ -116,7 +118,8 @@ class CriticNetwork(nn.Module):
         conv_out_size = self._get_conv_output(input_dims)
         
         self.lstm = nn.LSTM(conv_out_size, 512, batch_first=True)
-        self.fc = nn.Linear(512, 1)  # Changed from fc1 and fc2 to a single fc layer
+        self.fc1 = nn.Linear(512, 256)  # Changed back to fc1 and fc2
+        self.fc2 = nn.Linear(256, 1)
 
     def _get_conv_output(self, shape):
         o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
@@ -143,7 +146,8 @@ class CriticNetwork(nn.Module):
             x, hidden = self.lstm(x, hidden)
         
         x = x.squeeze(1)
-        value = self.fc(x)  # Directly use fc instead of fc1 and fc2
+        x = F.relu(self.fc1(x))
+        value = self.fc2(x)
         return value, hidden
 
 class FrameStack:

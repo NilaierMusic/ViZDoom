@@ -1,3 +1,4 @@
+import argparse
 import itertools as it
 import os
 import random
@@ -16,31 +17,35 @@ from tqdm import trange
 
 import vizdoom as vzd
 
-# Q-learning settings
-learning_rate = 0.00025
-discount_factor = 0.99
-train_epochs = 10
-learning_steps_per_epoch = 4000
-
-# NN learning settings
-batch_size = 64
-
-# Training regime
-test_episodes_per_epoch = 100
-
-# Other parameters
-frame_repeat = 12
-resolution = (90, 120)  # (height, width)
-episodes_to_watch = 10
-num_frames = 4  # Add this line
-
-model_savefile = "./model-doom-ppo-residual.pth"
-save_model = True
-load_model = False
-skip_learning = False
-
-# Configuration file path
-config_file_path = os.path.join(vzd.scenarios_path, "simpler_basic.cfg")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a PPO agent for ViZDoom.")
+    
+    # Q-learning settings
+    parser.add_argument('--learning_rate', type=float, default=0.00025, help='Learning rate for the optimizer')
+    parser.add_argument('--discount_factor', type=float, default=0.99, help='Discount factor for future rewards')
+    parser.add_argument('--train_epochs', type=int, default=10, help='Number of training epochs')
+    parser.add_argument('--learning_steps_per_epoch', type=int, default=4000, help='Number of learning steps per epoch')
+    
+    # NN learning settings
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
+    
+    # Training regime
+    parser.add_argument('--test_episodes_per_epoch', type=int, default=100, help='Number of test episodes per epoch')
+    
+    # Other parameters
+    parser.add_argument('--frame_repeat', type=int, default=12, help='Frame repeat for actions')
+    parser.add_argument('--resolution', type=tuple, default=(90, 120), help='Resolution of the game screen (height, width)')
+    parser.add_argument('--episodes_to_watch', type=int, default=10, help='Number of episodes to watch after training')
+    parser.add_argument('--num_frames', type=int, default=4, help='Number of frames to stack')
+    
+    parser.add_argument('--model_savefile', type=str, default="./model-doom-ppo-residual.pth", help='File path to save the model')
+    parser.add_argument('--save_model', type=bool, default=True, help='Whether to save the model after training')
+    parser.add_argument('--load_model', type=bool, default=False, help='Whether to load a pre-trained model')
+    parser.add_argument('--skip_learning', type=bool, default=False, help='Whether to skip the learning phase')
+    
+    parser.add_argument('--config_file_path', type=str, default=os.path.join(vzd.scenarios_path, "simpler_basic.cfg"), help='Path to the configuration file')
+    
+    return parser.parse_args()
 
 # Uses GPU if available
 if torch.cuda.is_available():
@@ -101,13 +106,14 @@ class ResidualBlock(nn.Module):
         return F.relu(out)
 
 class FrameStack:
-    def __init__(self, num_frames):
+    def __init__(self, num_frames, resolution):
         self.num_frames = num_frames
+        self.resolution = resolution
         self.frames = deque([], maxlen=num_frames)
 
     def reset(self):
         for _ in range(self.num_frames):
-            self.frames.append(np.zeros(resolution, dtype=np.float32))
+            self.frames.append(np.zeros(self.resolution, dtype=np.float32))
 
     def push(self, frame):
         self.frames.append(frame)
@@ -261,7 +267,7 @@ class CyclicalLR:
         return self.optimizer.param_groups[0]['lr']
 
 class PPOAgent:
-    def __init__(self, input_dims, n_actions, num_frames=4, base_lr=0.0001, max_lr=0.001, cycle_length=1000,
+    def __init__(self, input_dims, n_actions, resolution, num_frames=4, base_lr=0.0001, max_lr=0.001, cycle_length=1000,
                  gamma=0.99, gae_lambda=0.95, policy_clip=0.2, batch_size=64, n_epochs=10,
                  entropy_coefficient=0.01, max_grad_norm=0.5, weight_decay=0.01, accumulation_steps=4, n_steps=5):
         self.gamma = gamma
@@ -287,7 +293,7 @@ class PPOAgent:
         self.hidden_critic = None
         self.scaler = GradScaler()
         self.total_steps = 0
-        self.frame_stack = FrameStack(num_frames)
+        self.frame_stack = FrameStack(num_frames, resolution)
         
         self.n_steps = n_steps
 
@@ -384,7 +390,7 @@ class PPOAgent:
         self.hidden_actor = None
         self.hidden_critic = None
 
-def create_simple_game():
+def create_simple_game(config_file_path):
     print("Initializing doom...")
     game = vzd.DoomGame()
     game.load_config(config_file_path)
@@ -396,7 +402,7 @@ def create_simple_game():
     print("Doom initialized.")
     return game
 
-def test(game, agent):
+def test(game, agent, test_episodes_per_epoch, frame_repeat, resolution):
     """Runs a test_episodes_per_epoch episodes and prints the result"""
     print("\nTesting...")
     test_scores = []
@@ -421,7 +427,7 @@ def test(game, agent):
         "max: %.1f" % test_scores.max(),
     )
 
-def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
+def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch, resolution, save_model, model_savefile):
     start_time = time()
     for epoch in range(num_epochs):
         game.new_episode()
@@ -496,7 +502,7 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
             "max: %.1f," % train_scores.max(),
         )
 
-        test(game, agent)
+        test(game, agent, test_episodes_per_epoch, frame_repeat, resolution)
         if save_model:
             print("Saving the network weights to:", model_savefile)
             torch.save(agent.actor.state_dict(), model_savefile + "_actor.pth")
@@ -506,9 +512,28 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
     game.close()
     return agent, game
 
-if __name__ == "__main__":
+def main():
+    args = parse_args()
+    
+    # Use the parsed arguments
+    learning_rate = args.learning_rate
+    discount_factor = args.discount_factor
+    train_epochs = args.train_epochs
+    learning_steps_per_epoch = args.learning_steps_per_epoch
+    batch_size = args.batch_size
+    test_episodes_per_epoch = args.test_episodes_per_epoch
+    frame_repeat = args.frame_repeat
+    resolution = args.resolution
+    episodes_to_watch = args.episodes_to_watch
+    num_frames = args.num_frames
+    model_savefile = args.model_savefile
+    save_model = args.save_model
+    load_model = args.load_model
+    skip_learning = args.skip_learning
+    config_file_path = args.config_file_path
+
     # Initialize game and actions
-    game = create_simple_game()
+    game = create_simple_game(config_file_path)
     n = game.get_available_buttons_size()
     actions = [list(a) for a in it.product([0, 1], repeat=n)]
 
@@ -516,7 +541,8 @@ if __name__ == "__main__":
     agent = PPOAgent(
         input_dims=(4, *resolution),
         n_actions=len(actions),
-        base_lr=0.0001,
+        resolution=resolution,  # Pass the resolution here
+        base_lr=learning_rate,
         max_lr=0.001,
         cycle_length=1000,
         gamma=discount_factor,
@@ -526,7 +552,7 @@ if __name__ == "__main__":
         max_grad_norm=0.5,
         weight_decay=0.01,
         accumulation_steps=4,
-        n_steps=5  # Add this line
+        n_steps=5
     )
 
     if load_model:
@@ -542,6 +568,9 @@ if __name__ == "__main__":
             num_epochs=train_epochs,
             frame_repeat=frame_repeat,
             steps_per_epoch=learning_steps_per_epoch,
+            resolution=resolution,
+            save_model=save_model,
+            model_savefile=model_savefile
         )
 
         print("======================================")
@@ -571,3 +600,6 @@ if __name__ == "__main__":
         sleep(1.0)
         score = game.get_total_reward()
         print("Total score: ", score)
+
+if __name__ == "__main__":
+    main()
