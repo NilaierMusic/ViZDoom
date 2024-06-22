@@ -402,7 +402,7 @@ def create_simple_game(config_file_path):
     print("Doom initialized.")
     return game
 
-def test(game, agent, test_episodes_per_epoch, frame_repeat, resolution):
+def test(game, agent, actions, test_episodes_per_epoch, frame_repeat, resolution):
     """Runs a test_episodes_per_epoch episodes and prints the result"""
     print("\nTesting...")
     test_scores = []
@@ -502,7 +502,7 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch, resolut
             "max: %.1f," % train_scores.max(),
         )
 
-        test(game, agent, test_episodes_per_epoch, frame_repeat, resolution)
+        test(game, agent, actions, test_episodes_per_epoch, frame_repeat, resolution)
         if save_model:
             print("Saving the network weights to:", model_savefile)
             torch.save(agent.actor.state_dict(), model_savefile + "_actor.pth")
@@ -571,7 +571,7 @@ def main():
             resolution=resolution,
             save_model=save_model,
             model_savefile=model_savefile,
-            test_episodes_per_epoch=test_episodes_per_epoch  # Pass the variable here
+            test_episodes_per_epoch=test_episodes_per_epoch
         )
 
         print("======================================")
