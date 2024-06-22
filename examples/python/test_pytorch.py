@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import deque
 import vizdoom as vzd
 
 from vizdoom import DoomGame, Mode, ScreenFormat, ScreenResolution
@@ -20,7 +21,7 @@ frame_repeat = 12
 resolution = (90, 120)  # (height, width)
 
 # Model saving and loading parameters
-model_savefile = "./model-doom-ppo"
+model_savefile = "./model-doom-ppo-residual"
 actor_model_savefile = model_savefile + ".pth_actor.pth"
 critic_model_savefile = model_savefile + ".pth_critic.pth"
 
@@ -34,33 +35,57 @@ if torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        return F.relu(out)
+
 class ActorNetwork(nn.Module):
     def __init__(self, input_dims, n_actions):
         super(ActorNetwork, self).__init__()
         self.conv1 = nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2)
         self.bn1 = nn.BatchNorm2d(32)
+        self.res1 = ResidualBlock(32)
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
+        self.res2 = ResidualBlock(64)
         self.conv3 = nn.Conv2d(64, 64, 3, stride=1, padding=1)
         self.bn3 = nn.BatchNorm2d(64)
+        self.res3 = ResidualBlock(64)
         
         self.flatten = nn.Flatten()
         
         conv_out_size = self._get_conv_output(input_dims)
         
         self.lstm = nn.LSTM(conv_out_size, 512, batch_first=True)
-        self.fc = nn.Linear(512, n_actions)
+        self.fc = nn.Linear(512, n_actions)  # Changed from fc1 and fc2 to a single fc layer
 
     def _get_conv_output(self, shape):
-        o = self.bn1(self.conv1(torch.zeros(1, *shape)))
-        o = self.bn2(self.conv2(o))
-        o = self.bn3(self.conv3(o))
+        o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
+        o = self.res1(o)
+        o = F.relu(self.bn2(self.conv2(o)))
+        o = self.res2(o)
+        o = F.relu(self.bn3(self.conv3(o)))
+        o = self.res3(o)
         return int(np.prod(o.size()))
 
     def forward(self, state, hidden=None):
         x = F.relu(self.bn1(self.conv1(state)))
+        x = self.res1(x)
         x = F.relu(self.bn2(self.conv2(x)))
+        x = self.res2(x)
         x = F.relu(self.bn3(self.conv3(x)))
+        x = self.res3(x)
         x = self.flatten(x)
         x = x.unsqueeze(1)  # Add time dimension
         
@@ -70,7 +95,7 @@ class ActorNetwork(nn.Module):
             x, hidden = self.lstm(x, hidden)
         
         x = x.squeeze(1)
-        action_probs = F.softmax(self.fc(x), dim=-1)
+        action_probs = F.softmax(self.fc(x), dim=-1)  # Directly use fc instead of fc1 and fc2
         return action_probs, hidden
 
 class CriticNetwork(nn.Module):
@@ -78,28 +103,37 @@ class CriticNetwork(nn.Module):
         super(CriticNetwork, self).__init__()
         self.conv1 = nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2)
         self.bn1 = nn.BatchNorm2d(32)
+        self.res1 = ResidualBlock(32)
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
+        self.res2 = ResidualBlock(64)
         self.conv3 = nn.Conv2d(64, 64, 3, stride=1, padding=1)
         self.bn3 = nn.BatchNorm2d(64)
+        self.res3 = ResidualBlock(64)
         
         self.flatten = nn.Flatten()
         
         conv_out_size = self._get_conv_output(input_dims)
         
         self.lstm = nn.LSTM(conv_out_size, 512, batch_first=True)
-        self.fc = nn.Linear(512, 1)
+        self.fc = nn.Linear(512, 1)  # Changed from fc1 and fc2 to a single fc layer
 
     def _get_conv_output(self, shape):
-        o = self.bn1(self.conv1(torch.zeros(1, *shape)))
-        o = self.bn2(self.conv2(o))
-        o = self.bn3(self.conv3(o))
+        o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
+        o = self.res1(o)
+        o = F.relu(self.bn2(self.conv2(o)))
+        o = self.res2(o)
+        o = F.relu(self.bn3(self.conv3(o)))
+        o = self.res3(o)
         return int(np.prod(o.size()))
 
     def forward(self, state, hidden=None):
         x = F.relu(self.bn1(self.conv1(state)))
+        x = self.res1(x)
         x = F.relu(self.bn2(self.conv2(x)))
+        x = self.res2(x)
         x = F.relu(self.bn3(self.conv3(x)))
+        x = self.res3(x)
         x = self.flatten(x)
         x = x.unsqueeze(1)  # Add time dimension
         
@@ -109,21 +143,29 @@ class CriticNetwork(nn.Module):
             x, hidden = self.lstm(x, hidden)
         
         x = x.squeeze(1)
-        value = self.fc(x)
+        value = self.fc(x)  # Directly use fc instead of fc1 and fc2
         return value, hidden
+
+class FrameStack:
+    def __init__(self, num_frames):
+        self.num_frames = num_frames
+        self.frames = deque([], maxlen=num_frames)
+
+    def reset(self):
+        for _ in range(self.num_frames):
+            self.frames.append(np.zeros(resolution, dtype=np.float32))
+
+    def push(self, frame):
+        self.frames.append(frame)
+
+    def get(self):
+        # Ensure all frames are stacked along a new axis and are of the same type
+        return np.stack(self.frames, axis=0)
 
 # Converts and down-samples the input image
 def preprocess(img, resolution):
-    # Assuming img is already a numpy array of shape (480, 640)
-    # Resize the image to the specified resolution using OpenCV
     img_resized = cv2.resize(img, (resolution[1], resolution[0]), interpolation=cv2.INTER_LINEAR)
-    
-    # Normalize
     img_resized = img_resized.astype(np.float32) / 255.0
-    
-    # Reshape to (channel, height, width)
-    img_resized = img_resized.reshape(1, *img_resized.shape)
-    
     return img_resized
 
 # Creates and initializes ViZDoom environment
@@ -148,8 +190,8 @@ if __name__ == "__main__":
     actions = [list(a) for a in it.product([0, 1], repeat=n)]
 
     # Create instances of the actor and critic networks
-    actor = ActorNetwork((1, *resolution), len(actions)).to(DEVICE)
-    critic = CriticNetwork((1, *resolution)).to(DEVICE)
+    actor = ActorNetwork((4, *resolution), len(actions)).to(DEVICE)
+    critic = CriticNetwork((4, *resolution)).to(DEVICE)
 
     print("Loading actor model from: ", actor_model_savefile)
     actor.load_state_dict(torch.load(actor_model_savefile, map_location=DEVICE))
@@ -164,15 +206,21 @@ if __name__ == "__main__":
     game.set_mode(Mode.ASYNC_PLAYER)
     game.init()
 
+    frame_stack = FrameStack(4)  # Create a frame stack with 4 frames
+
     for _ in range(episodes_to_watch):
         game.new_episode()
+        frame_stack.reset()  # Reset the frame stack at the start of each episode
         hidden_actor = None
         hidden_critic = None
         while not game.is_episode_finished():
             state = preprocess(game.get_state().screen_buffer, resolution)
-            state = torch.from_numpy(state).float().unsqueeze(0).to(DEVICE)
+            frame_stack.push(state)
+            stacked_state = frame_stack.get()
             
-            probs, hidden_actor = actor(state, hidden_actor)
+            stacked_state = torch.from_numpy(stacked_state).float().unsqueeze(0).to(DEVICE)
+            
+            probs, hidden_actor = actor(stacked_state, hidden_actor)
             _, best_action_index = torch.max(probs, dim=1)
             best_action_index = best_action_index.item()
 
