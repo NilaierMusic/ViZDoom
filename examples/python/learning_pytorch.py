@@ -427,7 +427,7 @@ def test(game, agent, test_episodes_per_epoch, frame_repeat, resolution):
         "max: %.1f" % test_scores.max(),
     )
 
-def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch, resolution, save_model, model_savefile):
+def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch, resolution, save_model, model_savefile, test_episodes_per_epoch):
     start_time = time()
     for epoch in range(num_epochs):
         game.new_episode()
@@ -570,7 +570,8 @@ def main():
             steps_per_epoch=learning_steps_per_epoch,
             resolution=resolution,
             save_model=save_model,
-            model_savefile=model_savefile
+            model_savefile=model_savefile,
+            test_episodes_per_epoch=test_episodes_per_epoch  # Pass the variable here
         )
 
         print("======================================")
