@@ -113,7 +113,7 @@ class FrameStack:
 
     def reset(self):
         for _ in range(self.num_frames):
-            self.frames.append(np.zeros(self.resolution, dtype=np.float32))
+            self.frames.append(np.zeros((*self.resolution, 2), dtype=np.float32))
 
     def push(self, frame):
         self.frames.append(frame)
@@ -122,9 +122,23 @@ class FrameStack:
         return np.array(self.frames)
 
 def preprocess(img, resolution):
+    # Resize the image
     img_resized = cv2.resize(img, (resolution[1], resolution[0]), interpolation=cv2.INTER_LINEAR)
-    img_resized = img_resized.astype(np.float32) / 255.0
-    return img_resized
+    
+    # Check if the image is already grayscale
+    if len(img_resized.shape) == 2 or img_resized.shape[2] == 1:
+        img_gray = img_resized
+    else:
+        # Convert to grayscale if it's not already
+        img_gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
+    
+    # Apply edge detection
+    img_edges = cv2.Canny(img_gray, 100, 200)
+    
+    # Stack the grayscale image and edge detection result
+    img_combined = np.stack([img_gray, img_edges], axis=-1)
+    
+    return img_combined.astype(np.float32) / 255.0
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels):
@@ -144,7 +158,8 @@ class ResidualBlock(nn.Module):
 class ActorNetwork(nn.Module):
     def __init__(self, input_dims, n_actions):
         super(ActorNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2)
+        self.input_dims = input_dims
+        self.conv1 = nn.Conv2d(input_dims[0] * input_dims[3], 32, 8, stride=4, padding=2)
         self.bn1 = nn.BatchNorm2d(32)
         self.res1 = ResidualBlock(32)
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)
@@ -163,7 +178,8 @@ class ActorNetwork(nn.Module):
         self.fc2 = nn.Linear(256, n_actions)
 
     def _get_conv_output(self, shape):
-        o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
+        o = torch.zeros(1, shape[0] * shape[3], shape[1], shape[2])
+        o = F.relu(self.bn1(self.conv1(o)))
         o = self.res1(o)
         o = F.relu(self.bn2(self.conv2(o)))
         o = self.res2(o)
@@ -172,7 +188,10 @@ class ActorNetwork(nn.Module):
         return int(np.prod(o.size()))
 
     def forward(self, state, hidden=None):
-        x = F.relu(self.bn1(self.conv1(state)))
+        batch_size = state.size(0)
+        # Reshape the input: [batch_size, num_frames, height, width, channels] to [batch_size, num_frames * channels, height, width]
+        x = state.view(batch_size, self.input_dims[0] * self.input_dims[3], self.input_dims[1], self.input_dims[2])
+        x = F.relu(self.bn1(self.conv1(x)))
         x = self.res1(x)
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.res2(x)
@@ -194,7 +213,8 @@ class ActorNetwork(nn.Module):
 class CriticNetwork(nn.Module):
     def __init__(self, input_dims):
         super(CriticNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2)
+        self.input_dims = input_dims
+        self.conv1 = nn.Conv2d(input_dims[0] * input_dims[3], 32, 8, stride=4, padding=2)
         self.bn1 = nn.BatchNorm2d(32)
         self.res1 = ResidualBlock(32)
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)
@@ -213,7 +233,8 @@ class CriticNetwork(nn.Module):
         self.fc2 = nn.Linear(256, 1)
 
     def _get_conv_output(self, shape):
-        o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
+        o = torch.zeros(1, shape[0] * shape[3], shape[1], shape[2])
+        o = F.relu(self.bn1(self.conv1(o)))
         o = self.res1(o)
         o = F.relu(self.bn2(self.conv2(o)))
         o = self.res2(o)
@@ -222,7 +243,10 @@ class CriticNetwork(nn.Module):
         return int(np.prod(o.size()))
 
     def forward(self, state, hidden=None):
-        x = F.relu(self.bn1(self.conv1(state)))
+        batch_size = state.size(0)
+        # Reshape the input: [batch_size, num_frames, height, width, channels] to [batch_size, num_frames * channels, height, width]
+        x = state.view(batch_size, self.input_dims[0] * self.input_dims[3], self.input_dims[1], self.input_dims[2])
+        x = F.relu(self.bn1(self.conv1(x)))
         x = self.res1(x)
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.res2(x)
@@ -277,7 +301,7 @@ class PPOAgent:
         self.max_grad_norm = max_grad_norm
         self.accumulation_steps = accumulation_steps
         self.num_frames = num_frames
-        self.entropy_coefficient = entropy_coefficient  # Ensure this line is present
+        self.entropy_coefficient = entropy_coefficient
 
         self.actor = ActorNetwork(input_dims, n_actions).to(DEVICE)
         self.critic = CriticNetwork(input_dims).to(DEVICE)
@@ -296,11 +320,27 @@ class PPOAgent:
         self.frame_stack = FrameStack(num_frames, resolution)
         
         self.n_steps = n_steps
+        
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+
+        # Add these lines for experience replay
+        self.replay_buffer = deque(maxlen=10000)
+        self.replay_ratio = 4  # Number of replay samples per new sample
+
+        # Initialize last_health
+        self.last_health = 100
 
     def store_transition(self, state, action, probs, vals, reward, done):
         self.memory.store_memory(state, action, probs, vals, reward, done)
+        # Also store in replay buffer
+        self.replay_buffer.append((state, action, probs, vals, reward, done))
 
     def choose_action(self, observation):
+        if np.random.rand() < self.epsilon:
+            return np.random.randint(self.actor.fc2.out_features), 0, 0
+        
         if observation.ndim == 2:  # Single frame
             observation = np.stack([observation] * self.num_frames)
         state = torch.from_numpy(observation).float().unsqueeze(0).to(DEVICE)
@@ -330,6 +370,18 @@ class PPOAgent:
         for _ in range(self.n_epochs):
             state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr, batches = \
                 self.memory.generate_batches()
+
+            # Add experience replay
+            for _ in range(self.replay_ratio):
+                replay_sample = random.sample(self.replay_buffer, min(len(self.replay_buffer), self.memory.batch_size))
+                replay_state, replay_action, replay_old_prob, replay_vals, replay_reward, replay_dones = zip(*replay_sample)
+                
+                state_arr = np.concatenate([state_arr, np.array(replay_state)])
+                action_arr = np.concatenate([action_arr, np.array(replay_action)])
+                old_prob_arr = np.concatenate([old_prob_arr, np.array(replay_old_prob)])
+                vals_arr = np.concatenate([vals_arr, np.array(replay_vals)])
+                reward_arr = np.concatenate([reward_arr, np.array(replay_reward)])
+                dones_arr = np.concatenate([dones_arr, np.array(replay_dones)])
 
             values = vals_arr
             n_step_returns = self.calculate_n_step_returns(reward_arr, values, dones_arr)
@@ -386,6 +438,8 @@ class PPOAgent:
 
                 self.total_steps += 1
 
+        # Decay epsilon
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
         self.memory.clear_memory()
         self.hidden_actor = None
         self.hidden_critic = None
@@ -451,9 +505,22 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch, resolut
             action, log_prob, value = agent.choose_action(stacked_state)
             reward = game.make_action(actions[action], frame_repeat)
             
+            # Reward shaping
             if actions[action] == [0, 0, 0]:
                 reward -= 0.1
             
+            # Additional reward for killing enemies
+            reward += game.get_game_variable(vzd.GameVariable.KILLCOUNT) * 5
+            
+            # Penalty for taking damage
+            reward -= max(0, agent.last_health - game.get_game_variable(vzd.GameVariable.HEALTH)) * 0.1
+            
+            # Reward for picking up items
+            reward += game.get_game_variable(vzd.GameVariable.ITEMCOUNT) * 1
+            
+            # Update last health
+            agent.last_health = game.get_game_variable(vzd.GameVariable.HEALTH)
+
             done = game.is_episode_finished()
 
             episode_states.append(stacked_state)
@@ -488,6 +555,7 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch, resolut
                 agent.hidden_actor = None
                 agent.hidden_critic = None
                 agent.frame_stack.reset()
+                agent.last_health = 100  # Reset last health
 
             global_step += 1
 
@@ -539,9 +607,9 @@ def main():
 
     # Initialize our agent with the set parameters
     agent = PPOAgent(
-        input_dims=(4, *resolution),
+        input_dims=(num_frames, *resolution, 2),  # This should be (4, 90, 120, 2)
         n_actions=len(actions),
-        resolution=resolution,  # Pass the resolution here
+        resolution=resolution,
         base_lr=learning_rate,
         max_lr=0.001,
         cycle_length=1000,
@@ -585,12 +653,12 @@ def main():
 
     for _ in range(episodes_to_watch):
         game.new_episode()
-        agent.frame_stack.reset()  # Reset frame stack at the start of each episode
+        agent.frame_stack.reset()
         while not game.is_episode_finished():
             state = preprocess(game.get_state().screen_buffer, resolution)
-            agent.frame_stack.push(state)  # Push new state to frame stack
-            stacked_state = agent.frame_stack.get()  # Get stacked state
-            best_action_index, _, _ = agent.choose_action(stacked_state)  # Use stacked state
+            agent.frame_stack.push(state)
+            stacked_state = agent.frame_stack.get()
+            best_action_index, _, _ = agent.choose_action(stacked_state)
 
             # Instead of make_action(a, frame_repeat) in order to make the animation smooth
             game.set_action(actions[best_action_index])

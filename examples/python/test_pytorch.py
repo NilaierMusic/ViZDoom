@@ -53,7 +53,8 @@ class ResidualBlock(nn.Module):
 class ActorNetwork(nn.Module):
     def __init__(self, input_dims, n_actions):
         super(ActorNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2)
+        self.input_dims = input_dims
+        self.conv1 = nn.Conv2d(input_dims[0] * input_dims[3], 32, 8, stride=4, padding=2)
         self.bn1 = nn.BatchNorm2d(32)
         self.res1 = ResidualBlock(32)
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)
@@ -68,11 +69,14 @@ class ActorNetwork(nn.Module):
         conv_out_size = self._get_conv_output(input_dims)
         
         self.lstm = nn.LSTM(conv_out_size, 512, batch_first=True)
-        self.fc1 = nn.Linear(512, 256)  # Changed back to fc1 and fc2
+        self.fc1 = nn.Linear(512, 256)
         self.fc2 = nn.Linear(256, n_actions)
 
     def _get_conv_output(self, shape):
-        o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
+        # shape is (num_frames, height, width, channels)
+        # we need to create a tensor of shape (1, num_frames * channels, height, width)
+        o = torch.zeros(1, shape[0] * shape[3], shape[1], shape[2])
+        o = F.relu(self.bn1(self.conv1(o)))
         o = self.res1(o)
         o = F.relu(self.bn2(self.conv2(o)))
         o = self.res2(o)
@@ -81,7 +85,10 @@ class ActorNetwork(nn.Module):
         return int(np.prod(o.size()))
 
     def forward(self, state, hidden=None):
-        x = F.relu(self.bn1(self.conv1(state)))
+        batch_size = state.size(0)
+        # Reshape the input: [batch_size, num_frames, height, width, channels] to [batch_size, num_frames * channels, height, width]
+        x = state.view(batch_size, self.input_dims[0] * self.input_dims[3], self.input_dims[1], self.input_dims[2])
+        x = F.relu(self.bn1(self.conv1(x)))
         x = self.res1(x)
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.res2(x)
@@ -103,7 +110,8 @@ class ActorNetwork(nn.Module):
 class CriticNetwork(nn.Module):
     def __init__(self, input_dims):
         super(CriticNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(input_dims[0], 32, 8, stride=4, padding=2)
+        self.input_dims = input_dims
+        self.conv1 = nn.Conv2d(8, 32, 8, stride=4, padding=2)
         self.bn1 = nn.BatchNorm2d(32)
         self.res1 = ResidualBlock(32)
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)
@@ -122,7 +130,9 @@ class CriticNetwork(nn.Module):
         self.fc2 = nn.Linear(256, 1)
 
     def _get_conv_output(self, shape):
-        o = F.relu(self.bn1(self.conv1(torch.zeros(1, *shape))))
+        # Use 8 channels instead of shape[0] * shape[3]
+        o = torch.zeros(1, 8, shape[1], shape[2])
+        o = F.relu(self.bn1(self.conv1(o)))
         o = self.res1(o)
         o = F.relu(self.bn2(self.conv2(o)))
         o = self.res2(o)
@@ -131,7 +141,10 @@ class CriticNetwork(nn.Module):
         return int(np.prod(o.size()))
 
     def forward(self, state, hidden=None):
-        x = F.relu(self.bn1(self.conv1(state)))
+        batch_size = state.size(0)
+        # Reshape the input to have 8 channels
+        x = state.view(batch_size, 8, self.input_dims[1], self.input_dims[2])
+        x = F.relu(self.bn1(self.conv1(x)))
         x = self.res1(x)
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.res2(x)
@@ -157,20 +170,22 @@ class FrameStack:
 
     def reset(self):
         for _ in range(self.num_frames):
-            self.frames.append(np.zeros(resolution, dtype=np.float32))
+            self.frames.append(np.zeros((*resolution, 2), dtype=np.float32))
 
     def push(self, frame):
         self.frames.append(frame)
 
     def get(self):
-        # Ensure all frames are stacked along a new axis and are of the same type
-        return np.stack(self.frames, axis=0)
+        # Stack frames along the channel dimension
+        return np.concatenate(self.frames, axis=-1)
 
 # Converts and down-samples the input image
 def preprocess(img, resolution):
     img_resized = cv2.resize(img, (resolution[1], resolution[0]), interpolation=cv2.INTER_LINEAR)
     img_resized = img_resized.astype(np.float32) / 255.0
-    return img_resized
+    # Add a second channel (you might want to use a different processing for the second channel)
+    img_2channel = np.stack([img_resized, img_resized], axis=-1)
+    return img_2channel
 
 # Creates and initializes ViZDoom environment
 def initialize_vizdoom(config_file_path):
@@ -194,8 +209,8 @@ if __name__ == "__main__":
     actions = [list(a) for a in it.product([0, 1], repeat=n)]
 
     # Create instances of the actor and critic networks
-    actor = ActorNetwork((4, *resolution), len(actions)).to(DEVICE)
-    critic = CriticNetwork((4, *resolution)).to(DEVICE)
+    actor = ActorNetwork((4, *resolution, 2), len(actions)).to(DEVICE)
+    critic = CriticNetwork((4, *resolution, 2)).to(DEVICE)  # Change to 2 channels
 
     print("Loading actor model from: ", actor_model_savefile)
     actor.load_state_dict(torch.load(actor_model_savefile, map_location=DEVICE))
