@@ -677,8 +677,12 @@ def main():
         game.new_episode()
         agent.frame_stack.reset()
         while not game.is_episode_finished():
-            state = preprocess(game.get_state().screen_buffer, resolution)
-            agent.frame_stack.push(state)
+            state = game.get_state()
+            screen_buffer = preprocess_multi_buffer([state.screen_buffer], resolution)[0]
+            depth_buffer = preprocess_multi_buffer([state.depth_buffer], resolution)[0]
+            labels_buffer = preprocess_multi_buffer([state.labels_buffer], resolution)[0]
+            
+            agent.frame_stack.push([screen_buffer, depth_buffer, labels_buffer])
             stacked_state = agent.frame_stack.get()
             best_action_index, _, _ = agent.choose_action(stacked_state)
 
