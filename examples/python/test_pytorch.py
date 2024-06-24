@@ -26,7 +26,7 @@ actor_model_savefile = model_savefile + ".pth_actor.pth"
 critic_model_savefile = model_savefile + ".pth_critic.pth"
 
 # Configuration file path
-config_file_path = os.path.join(vzd.scenarios_path, "simpler_basic.cfg")
+config_file_path = os.path.join(vzd.scenarios_path, "doom.cfg")
 
 # Uses GPU if available
 if torch.cuda.is_available():
@@ -152,8 +152,13 @@ if __name__ == "__main__":
     n = game.get_available_buttons_size()
     actions = [list(a) for a in it.product([0, 1], repeat=n)]
 
+    # Ensure the number of actions matches the saved model
+    n_actions = len(actions)
+    if n_actions != 8:
+        raise ValueError(f"Number of actions ({n_actions}) does not match the saved model's number of actions (8).")
+
     # Create instances of the actor and critic networks
-    actor = ActorNetwork((4, *resolution), len(actions)).to(DEVICE)
+    actor = ActorNetwork((4, *resolution), n_actions).to(DEVICE)
     critic = CriticNetwork((4, *resolution)).to(DEVICE)
 
     print("Loading actor model from: ", actor_model_savefile)
