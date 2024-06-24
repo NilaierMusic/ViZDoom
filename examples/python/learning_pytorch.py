@@ -65,13 +65,13 @@ class DiverseExperienceReplay:
         if len(self.buffer) >= self.capacity:
             most_common_action = np.argmax(self.action_counts)
             for i, exp in enumerate(self.buffer):
-                if exp[1] == most_common_action:
+                if exp[2] == most_common_action:  # Changed from exp[1] to exp[2]
                     del self.buffer[i]
                     self.action_counts[most_common_action] -= 1
                     break
         
         self.buffer.append(experience)
-        self.action_counts[experience[1]] += 1
+        self.action_counts[experience[2]] += 1  # Changed from experience[1] to experience[2]
 
     def sample(self, batch_size):
         probs = 1 / (self.action_counts + 1)
@@ -209,6 +209,33 @@ class NoisyNetwork(nn.Module):
         self.fc2.reset_noise()
         self.fc3.reset_noise()
 
+class RND(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(RND, self).__init__()
+        self.target = nn.Sequential(
+            nn.Linear(input_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_size)
+        )
+        self.predictor = nn.Sequential(
+            nn.Linear(input_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_size)
+        )
+        
+        # Initialize target network
+        for param in self.target.parameters():
+            param.requires_grad = False
+    
+    def forward(self, x):
+        target_feature = self.target(x)
+        predict_feature = self.predictor(x)
+        return target_feature, predict_feature
+
 class MultiBufferActorNetwork(nn.Module):
     def __init__(self, input_dims, n_actions):
         super(MultiBufferActorNetwork, self).__init__()
@@ -220,8 +247,9 @@ class MultiBufferActorNetwork(nn.Module):
         
         conv_out_size = self._get_conv_output(input_dims)
         
-        self.fc1 = NoisyLinear(conv_out_size, 512)
-        self.fc2 = NoisyLinear(512, n_actions)
+        self.fc1 = nn.Linear(conv_out_size, 512)
+        self.lstm = nn.LSTM(512, 512, batch_first=True)
+        self.fc2 = nn.Linear(512, n_actions)
 
     def _get_conv_output(self, shape):
         o = F.relu(self.conv1(torch.zeros(1, shape[0] * shape[1], shape[2], shape[3])))
@@ -229,15 +257,16 @@ class MultiBufferActorNetwork(nn.Module):
         o = F.relu(self.conv3(o))
         return int(np.prod(o.size()))
 
-    def forward(self, state):
+    def forward(self, state, hidden):
         x = state.view(state.size(0), -1, state.size(-2), state.size(-1))
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = self.flatten(x)
         x = F.relu(self.fc1(x))
-        action_logits = self.fc2(x)
-        return action_logits
+        x, hidden = self.lstm(x.unsqueeze(1), hidden)
+        action_logits = self.fc2(x.squeeze(1))
+        return action_logits, hidden
 
 class MultiBufferCriticNetwork(nn.Module):
     def __init__(self, input_dims):
@@ -386,15 +415,23 @@ class MultiBufferPPOAgent:
         state_dim = np.prod(input_dims)  # Calculate total state dimension
         self.icm = ICM(state_dim=input_dims, action_dim=n_actions, hidden_dim=256).to(DEVICE)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=1e-3)
+        
+        self.rnd = RND(np.prod(input_dims), 128).to(DEVICE)
+        self.rnd_optimizer = optim.Adam(self.rnd.predictor.parameters(), lr=1e-3)
+
+        self.hidden = None
 
     def store_transition(self, state, next_state, action, probs, vals, reward, done):
-        intrinsic_reward = self.compute_intrinsic_reward(state, next_state, action)
-        total_reward = reward + intrinsic_reward
-        self.memory.add((state, action, probs, vals, total_reward, done))
+        intrinsic_reward = self.compute_intrinsic_reward(state)
+        total_reward = reward + 0.01 * intrinsic_reward  # Scale the intrinsic reward
+        self.memory.add((state, next_state, action, probs, vals, total_reward, done))
 
     def choose_action(self, observation):
         state = torch.from_numpy(observation).float().unsqueeze(0).to(DEVICE)
-        action_logits = self.actor(state)
+        if self.hidden is None:
+            self.hidden = (torch.zeros(1, 1, 512).to(DEVICE),
+                           torch.zeros(1, 1, 512).to(DEVICE))
+        action_logits, self.hidden = self.actor(state, self.hidden)
         dist = Categorical(logits=action_logits)
         action = dist.sample()
         action_log_prob = dist.log_prob(action)
@@ -415,28 +452,15 @@ class MultiBufferPPOAgent:
             n_step_returns[t] = n_step_return
         return n_step_returns
 
-    def compute_intrinsic_reward(self, state, next_state, action):
-        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(DEVICE)
-        next_state = torch.tensor(next_state, dtype=torch.float).unsqueeze(0).to(DEVICE)
-        action = torch.tensor(action, dtype=torch.long).to(DEVICE)
-        
-        pred_action, pred_next_state_feat, next_state_feat = self.icm(state, next_state, action)
-        
-        forward_loss = F.mse_loss(pred_next_state_feat, next_state_feat.detach())
-        inverse_loss = F.cross_entropy(pred_action, action.unsqueeze(0))
-        
-        intrinsic_reward = forward_loss.item()
-        
-        loss = forward_loss + inverse_loss
-        self.icm_optimizer.zero_grad()
-        loss.backward()
-        self.icm_optimizer.step()
-        
+    def compute_intrinsic_reward(self, state):
+        state = torch.tensor(state, dtype=torch.float).view(1, -1).to(DEVICE)
+        target_feature, predict_feature = self.rnd(state)
+        intrinsic_reward = F.mse_loss(predict_feature, target_feature.detach()).item()
         return intrinsic_reward
 
     def learn(self):
         for _ in range(self.n_epochs):
-            state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr = zip(*self.memory.buffer)
+            state_arr, next_state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr = zip(*self.memory.buffer)
             state_arr = np.array(state_arr)
             action_arr = np.array(action_arr)
             old_prob_arr = np.array(old_prob_arr)
@@ -458,12 +482,17 @@ class MultiBufferPPOAgent:
 
             values = torch.tensor(values).to(DEVICE)
             batches = self.memory.generate_batches(self.batch_size)
+
             for batch in batches:
                 states = torch.tensor(state_arr[batch], dtype=torch.float).to(DEVICE)
                 old_probs = torch.tensor(old_prob_arr[batch]).to(DEVICE)
                 actions = torch.tensor(action_arr[batch]).to(DEVICE)
 
-                action_logits = self.actor(states)
+                # Initialize hidden state for LSTM
+                hidden = (torch.zeros(1, states.size(0), 512).to(DEVICE),
+                          torch.zeros(1, states.size(0), 512).to(DEVICE))
+
+                action_logits, _ = self.actor(states, hidden)
                 dist = Categorical(logits=action_logits)
                 critic_value = self.critic(states).squeeze()
 
@@ -479,6 +508,7 @@ class MultiBufferPPOAgent:
 
                 entropy = dist.entropy().mean()
                 total_loss = actor_loss + 0.5*critic_loss - self.entropy_coefficient*entropy
+
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
                 total_loss.backward()
@@ -486,6 +516,14 @@ class MultiBufferPPOAgent:
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
+
+            # Add RND update
+            states = torch.tensor(np.array(state_arr), dtype=torch.float).to(DEVICE)
+            target_feature, predict_feature = self.rnd(states.view(states.size(0), -1))
+            rnd_loss = F.mse_loss(predict_feature, target_feature.detach())
+            self.rnd_optimizer.zero_grad()
+            rnd_loss.backward()
+            self.rnd_optimizer.step()
 
         self.memory.clear_memory()
 
@@ -548,6 +586,7 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch, save_mo
         global_step = 0
         print(f"\nEpoch #{epoch + 1}")
         agent.frame_stack.reset()
+        agent.hidden = None  # Reset LSTM hidden state at the start of each episode
         
         for _ in trange(steps_per_epoch, leave=False):
             state = game.get_state()
@@ -582,15 +621,19 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch, save_mo
             global_step += 1
 
         agent.learn()
-        train_scores = np.array(train_scores)
-
-        print(
-            "Results: mean: {:.1f} +/- {:.1f},".format(
-                train_scores.mean(), train_scores.std()
-            ),
-            "min: %.1f," % train_scores.min(),
-            "max: %.1f," % train_scores.max(),
-        )
+        
+        # Modified part to handle empty train_scores
+        if train_scores:
+            train_scores = np.array(train_scores)
+            print(
+                "Results: mean: {:.1f} +/- {:.1f},".format(
+                    train_scores.mean(), train_scores.std()
+                ),
+                "min: %.1f," % train_scores.min(),
+                "max: %.1f," % train_scores.max(),
+            )
+        else:
+            print("No episodes completed in this epoch.")
 
         test(game, agent, actions, test_episodes_per_epoch, frame_repeat, resolution)
         if save_model:
